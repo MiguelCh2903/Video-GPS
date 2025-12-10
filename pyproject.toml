@@ -1,0 +1,65 @@
+[project]
+name = "videogps"
+version = "1.0.0"
+description = "Generate GPS-overlayed videos from ROS2 rosbags with stereo cameras"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    {name = "VideoGPS Team"}
+]
+license = {text = "MIT"}
+keywords = ["ros2", "rosbag", "gps", "video", "stereo", "computer-vision"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Multimedia :: Video",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "opencv-python>=4.5.0",
+    "pyyaml>=6.0",
+    "rosbags>=0.11.0",
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "flake8>=4.0.0",
+    "mypy>=0.950",
+]
+
+[project.scripts]
+videogps = "videogps.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["videogps*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

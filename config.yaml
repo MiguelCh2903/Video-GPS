@@ -1,0 +1,63 @@
+# Configuration file for VideoGPS
+# Generate GPS-overlayed videos from ROS2 rosbags with stereo cameras
+
+# Calibration path
+calibration_path: stereo_calib.json
+
+# Logging configuration
+log_level: INFO  # DEBUG, INFO, WARNING, ERROR
+log_file: null  # Optional: path to log file
+
+# Camera configuration
+camera:
+  # ROS2 topics for stereo cameras
+  topic_left: /camera_left/image_raw/compressed
+  topic_right: /camera_right/image_raw/compressed
+  
+  # Stereo synchronization tolerance (nanoseconds)
+  # Frames must be within this time window to be paired
+  # 50ms = 50,000,000 ns (suitable for 24fps cameras)
+  sync_tolerance_ns: 50000000
+  
+  # Image rectification (undistortion)
+  rectify_enabled: true
+  undistort_quality: high  # low, medium, high
+  
+  # Maximum output video width (maintains aspect ratio)
+  max_width: 1920
+
+# GPS configuration
+gps:
+  # ROS2 topic for GPS/GNSS data
+  topic: /swift/navsat_fix
+  
+  # Enable GPS interpolation for missing timestamps
+  # Recommended: true for smoother overlay
+  interpolation_enabled: true
+  
+  # Outlier filtering
+  outlier_filter_enabled: false
+  min_satellites: 4  # Minimum satellites for valid fix
+
+# GPS overlay configuration
+overlay:
+  enabled: false  # Set to true to show GPS info on video
+  position: top_left  # top_left, top_right, bottom_left, bottom_right
+  font_scale: 0.7
+  thickness: 2
+  bg_alpha: 0.6  # Background transparency (0=transparent, 1=opaque)
+  
+  # Display options
+  show_speed: true
+  show_altitude: true
+  show_distance: true
+  show_timestamp: false
+
+# Video output configuration
+video:
+  output_fps: 24  # Match camera frame rate
+  codec: libx264  # libx264 (H.264), libx265 (H.265 better compression but slower)
+  crf: 23  # Constant Rate Factor: 0-51 (lower=better quality, 18=visually lossless, 23=default, 28=good balance for file size)
+  preset: medium  # Encoding speed: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+  output_dir: output
+  embed_gps_track: true  # Embed GPS data for instant segmentation
