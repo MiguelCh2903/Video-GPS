@@ -65,6 +65,9 @@ class GPSTrajectory:
         # Statistics
         self.filtered_count = 0
         self.total_distance_m = 0.0
+        
+        # Batch mode optimization
+        self._batch_points: List[GPSPoint] = []
     
     def add_point(
         self,
@@ -77,8 +80,8 @@ class GPSTrajectory:
         """
         Add GPS point with validation and outlier filtering.
         
-        Complexity: O(n) for insertion (maintains sorted order)
-        Can be optimized with batch insertion O(n log n)
+        OPTIMIZED: Accumulates points in batch for O(n log n) bulk insert.
+        Call finalize_batch() after all points are added.
         
         Args:
             timestamp: Point timestamp in nanoseconds
@@ -103,26 +106,84 @@ class GPSTrajectory:
         
         point = GPSPoint(timestamp, lat, lon, alt, num_satellites=num_satellites)
         
-        # Outlier filtering
-        if self.enable_filtering and len(self.points) > 0:
-            if not self._validate_point(point):
-                self.filtered_count += 1
+        # Add to batch instead of inserting directly
+        self._batch_points.append(point)
+        return True
+    
+    def finalize_batch(self):
+        """
+        Process accumulated batch points efficiently.
+        Sorts all points at once: O(n log n) instead of O(n²).
+        """
+        if not self._batch_points:
+            return
+        
+        # Sort batch by timestamp
+        self._batch_points.sort(key=lambda p: p.timestamp)
+        
+        # Filter outliers if enabled
+        if self.enable_filtering:
+            filtered_points = []
+            for point in self._batch_points:
+                if len(filtered_points) == 0 or self._validate_point_against(point, filtered_points[-1]):
+                    filtered_points.append(point)
+                else:
+                    self.filtered_count += 1
+            self._batch_points = filtered_points
+        
+        # Add to main trajectory
+        self.points.extend(self._batch_points)
+        self._timestamps.extend([p.timestamp for p in self._batch_points])
+        
+        # Calculate total distance
+        for i in range(1, len(self.points)):
+            dist = haversine_distance(
+                self.points[i-1].lat, self.points[i-1].lon,
+                self.points[i].lat, self.points[i].lon
+            )
+            self.total_distance_m += dist
+        
+        # Clear batch
+        self._batch_points = []
+    
+    def _validate_point_against(self, point: GPSPoint, prev_point: GPSPoint) -> bool:
+        """
+        Validate point against a specific previous point.
+        
+        Args:
+            point: GPS point to validate
+            prev_point: Previous GPS point
+            
+        Returns:
+            True if point passes validation
+        """
+        # Calculate distance and time
+        dist = haversine_distance(
+            prev_point.lat, prev_point.lon,
+            point.lat, point.lon
+        )
+        time_diff_s = (point.timestamp - prev_point.timestamp) / 1e9
+        
+        if time_diff_s <= 0:
+            return False
+        
+        # Calculate instantaneous speed
+        speed = dist / time_diff_s
+        
+        # Check maximum speed
+        if speed > self.max_speed:
+            self.logger.debug(f"Speed outlier detected: {speed:.2f} m/s")
+            return False
+        
+        # Check acceleration if we have speed history
+        if prev_point.speed is not None:
+            acceleration = abs(speed - prev_point.speed) / time_diff_s
+            if acceleration > self.max_acceleration:
+                self.logger.debug(f"Acceleration outlier: {acceleration:.2f} m/s²")
                 return False
         
-        # Insert in sorted order
-        idx = bisect.bisect_left(self._timestamps, timestamp)
-        self._timestamps.insert(idx, timestamp)
-        self.points.insert(idx, point)
-        
-        # Update cumulative distance
-        if len(self.points) > 1:
-            prev_point = self.points[idx - 1] if idx > 0 else None
-            if prev_point:
-                dist = haversine_distance(
-                    prev_point.lat, prev_point.lon,
-                    point.lat, point.lon
-                )
-                self.total_distance_m += dist
+        # Store calculated speed
+        point.speed = speed
         
         return True
     

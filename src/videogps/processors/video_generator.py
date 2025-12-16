@@ -276,10 +276,9 @@ class VideoGenerator:
                 if gps_writer is not None:
                     gps_writer.add_gps_point(left_ts, gps_point, frame_count)
                 
-                # Calculate speed and accumulated distance (only if overlay enabled)
-                speed = 0.0
+                # OPTIMIZED: Only calculate speed/distance when overlay is enabled
                 if self.config.overlay.enabled:
-                    # Binary search for GPS index (optimized)
+                    # Binary search for GPS index
                     gps_idx = bisect.bisect_left(
                         self.trajectory._timestamps,
                         gps_point.timestamp
@@ -293,6 +292,7 @@ class VideoGenerator:
                     elif gps_idx > 0:
                         gps_idx -= 1
                     
+                    speed = 0.0
                     if 0 <= gps_idx < len(self.trajectory.points):
                         speed = self.trajectory.calculate_speed_at(gps_idx)
                         
@@ -421,14 +421,19 @@ class VideoGenerator:
                                 for line in stderr_lines[-20:]:  # Last 20 lines
                                     if line:
                                         self.logger.error(f"  {line}")
-                        del frame  # Free memory
+                        del frame, left_frame, right_frame, gps_point  # Free memory
                         break
                 else:
                     video_writer.write(frame)
                 
-                # Free frame memory immediately after writing
-                del frame
+                # Free all frame memory immediately after writing
+                del frame, left_frame, right_frame, gps_point
                 frame_count += 1
+                
+                # Periodic garbage collection every 100 frames
+                if frame_count % 100 == 0:
+                    import gc
+                    gc.collect()
             
             # Finalize video
             if video_writer is not None:

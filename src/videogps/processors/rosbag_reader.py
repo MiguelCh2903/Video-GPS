@@ -114,6 +114,9 @@ class RosbagReader:
                         self.logger.debug(f"Error parsing GPS message: {e}")
                         continue
         
+        # Finalize batch processing for efficient sorting
+        trajectory.finalize_batch()
+        
         if len(trajectory) == 0:
             self.logger.error("No valid GPS points extracted")
             return None
@@ -152,13 +155,13 @@ class RosbagReader:
         """
         self.logger.info("Extracting synchronized stereo frames")
         
-        # Window size: keep 5 seconds of right frames in buffer
-        # At 24fps, this is ~120 frames, enough for good sync without excessive memory
-        window_duration_ns = 5_000_000_000  # 5 seconds
+        # OPTIMIZED: Use streaming approach with limited buffer
+        # Only keep recent right frames in memory (max 100 frames ~ 4 seconds @ 24fps)
+        max_buffer_size = 100
         
-        # Build timestamp index for right frames first (lightweight - only stores raw data)
+        # Build lightweight timestamp index (only timestamps and positions, no rawdata)
         self.logger.info("Indexing right camera timestamps...")
-        right_timestamps = {}
+        right_ts_list = []
         with AnyReader([self.rosbag_path], default_typestore=self.typestore) as reader:
             right_conns = [c for c in reader.connections if c.topic == right_topic]
             
@@ -174,99 +177,113 @@ class RosbagReader:
                 # Filter by time range
                 if time_range and (timestamp < time_range[0] or timestamp > time_range[1]):
                     continue
-                right_timestamps[timestamp] = (rawdata, connection.msgtype)
+                right_ts_list.append(timestamp)
         
-        self.logger.info(f"Indexed {len(right_timestamps)} right frames")
+        self.logger.info(f"Indexed {len(right_ts_list)} right frames")
         
-        # Sort right timestamps for efficient windowing
-        sorted_right_ts = sorted(right_timestamps.keys())
+        # Sort right timestamps
+        sorted_right_ts = sorted(right_ts_list)
+        del right_ts_list  # Free memory
         
-        # Second pass: Process left frames with sliding window of right frames
-        self.logger.info("Processing left camera frames...")
+        # OPTIMIZED: Process with two simultaneous readers and limited buffer
+        self.logger.info("Processing stereo frames with streaming...")
         synced_count = 0
         dropped_count = 0
         
-        with AnyReader([self.rosbag_path], default_typestore=self.typestore) as reader:
-            left_conns = [c for c in reader.connections if c.topic == left_topic]
+        # Open left reader
+        with AnyReader([self.rosbag_path], default_typestore=self.typestore) as left_reader:
+            left_conns = [c for c in left_reader.connections if c.topic == left_topic]
             
             if not left_conns:
                 self.logger.error(f"Left camera topic not found: {left_topic}")
                 return
             
-            # Cache for current window of right frames
-            right_frame_cache = {}
-            window_start_idx = 0
-            
-            for connection, timestamp, rawdata in tqdm(
-                reader.messages(connections=left_conns),
-                desc="Syncing stereo pairs",
-                unit="frame"
-            ):
-                # Filter by time range
-                if time_range and (timestamp < time_range[0] or timestamp > time_range[1]):
-                    continue
+            # Open right reader for on-demand loading
+            with AnyReader([self.rosbag_path], default_typestore=self.typestore) as right_reader:
+                right_conns = [c for c in right_reader.connections if c.topic == right_topic]
                 
+                # Build iterator for right frames
+                right_iter = right_reader.messages(connections=right_conns)
+                
+                # Limited circular buffer for right frames
+                from collections import deque
+                right_buffer = deque(maxlen=max_buffer_size)
+                right_exhausted = False
+                
+                # Pre-load initial buffer
                 try:
-                    msg = reader.deserialize(rawdata, connection.msgtype)
-                    left_frame = self._decode_image(msg)
-                    
-                    if left_frame is None:
+                    for _ in range(max_buffer_size):
+                        connection, r_ts, rawdata = next(right_iter)
+                        if time_range and (r_ts < time_range[0] or r_ts > time_range[1]):
+                            continue
+                        msg = right_reader.deserialize(rawdata, connection.msgtype)
+                        r_frame = self._decode_image(msg)
+                        if r_frame is not None:
+                            right_buffer.append((r_ts, r_frame))
+                except StopIteration:
+                    right_exhausted = True
+                
+                # Process left frames
+                for connection, timestamp, rawdata in tqdm(
+                    left_reader.messages(connections=left_conns),
+                    desc="Syncing stereo pairs",
+                    unit="frame"
+                ):
+                    # Filter by time range
+                    if time_range and (timestamp < time_range[0] or timestamp > time_range[1]):
                         continue
                     
-                    # Update right frame window: load frames within window of current left timestamp
-                    window_start = timestamp - window_duration_ns
-                    window_end = timestamp + window_duration_ns
-                    
-                    # Remove old frames from cache
-                    right_frame_cache = {ts: frame for ts, frame in right_frame_cache.items() 
-                                        if ts >= window_start}
-                    
-                    # Add new frames to cache within window
-                    while window_start_idx < len(sorted_right_ts):
-                        right_ts = sorted_right_ts[window_start_idx]
+                    try:
+                        msg = left_reader.deserialize(rawdata, connection.msgtype)
+                        left_frame = self._decode_image(msg)
                         
-                        if right_ts > window_end:
-                            break
+                        if left_frame is None:
+                            continue
                         
-                        if right_ts >= window_start and right_ts not in right_frame_cache:
-                            # Load and decode this right frame
-                            try:
-                                rawdata, msgtype = right_timestamps[right_ts]
-                                right_msg = reader.deserialize(rawdata, msgtype)
-                                right_frame = self._decode_image(right_msg)
-                                if right_frame is not None:
-                                    right_frame_cache[right_ts] = right_frame
-                            except Exception as e:
-                                self.logger.debug(f"Error decoding right frame: {e}")
+                        # Load more right frames if needed (keep buffer ahead)
+                        if not right_exhausted and len(right_buffer) > 0:
+                            last_right_ts = right_buffer[-1][0]
+                            while last_right_ts < timestamp + sync_tolerance_ns:
+                                try:
+                                    connection, r_ts, rawdata = next(right_iter)
+                                    if time_range and (r_ts < time_range[0] or r_ts > time_range[1]):
+                                        continue
+                                    msg = right_reader.deserialize(rawdata, connection.msgtype)
+                                    r_frame = self._decode_image(msg)
+                                    if r_frame is not None:
+                                        right_buffer.append((r_ts, r_frame))
+                                        last_right_ts = r_ts
+                                except StopIteration:
+                                    right_exhausted = True
+                                    break
                         
-                        window_start_idx += 1
-                    
-                    # Find best matching right frame within tolerance
-                    best_match = None
-                    min_diff = float('inf')
-                    
-                    for right_ts, right_frame in right_frame_cache.items():
-                        time_diff = abs(timestamp - right_ts)
-                        if time_diff <= sync_tolerance_ns and time_diff < min_diff:
-                            min_diff = time_diff
-                            best_match = (right_ts, right_frame)
-                    
-                    if best_match is None:
-                        dropped_count += 1
+                        # Find best match in buffer
+                        best_match = None
+                        min_diff = float('inf')
+                        
+                        for r_ts, r_frame in right_buffer:
+                            time_diff = abs(timestamp - r_ts)
+                            if time_diff <= sync_tolerance_ns and time_diff < min_diff:
+                                min_diff = time_diff
+                                best_match = (r_ts, r_frame)
+                        
+                        if best_match is None:
+                            dropped_count += 1
+                            del left_frame
+                            continue
+                        
+                        right_timestamp, right_frame = best_match
+                        
+                        synced_count += 1
+                        # Make copies to avoid issues with buffer reuse
+                        yield timestamp, left_frame.copy(), right_frame.copy(), right_timestamp, min_diff
+                        
+                        # Free memory immediately
                         del left_frame
+                        
+                    except Exception as e:
+                        self.logger.debug(f"Error processing left frame: {e}")
                         continue
-                    
-                    right_timestamp, right_frame = best_match
-                    
-                    synced_count += 1
-                    yield timestamp, left_frame, right_frame, right_timestamp, min_diff
-                    
-                    # Free memory immediately after yield
-                    del left_frame, right_frame
-                    
-                except Exception as e:
-                    self.logger.debug(f"Error processing left frame: {e}")
-                    continue
         
         self.logger.info(
             f"Stereo sync complete: {synced_count} pairs, {dropped_count} dropped"
