@@ -152,10 +152,13 @@ class RosbagReader:
         """
         self.logger.info("Extracting synchronized stereo frames")
         
-        synchronizer = StereoSynchronizer(tolerance_ns=sync_tolerance_ns)
+        # Window size: keep 5 seconds of right frames in buffer
+        # At 24fps, this is ~120 frames, enough for good sync without excessive memory
+        window_duration_ns = 5_000_000_000  # 5 seconds
         
-        # First pass: Load all right frames into synchronizer
-        self.logger.info("Loading right camera frames for synchronization...")
+        # Build timestamp index for right frames first (lightweight - only stores raw data)
+        self.logger.info("Indexing right camera timestamps...")
+        right_timestamps = {}
         with AnyReader([self.rosbag_path], default_typestore=self.typestore) as reader:
             right_conns = [c for c in reader.connections if c.topic == right_topic]
             
@@ -165,25 +168,20 @@ class RosbagReader:
             
             for connection, timestamp, rawdata in tqdm(
                 reader.messages(connections=right_conns),
-                desc="Loading right camera",
+                desc="Indexing right camera",
                 unit="frame"
             ):
                 # Filter by time range
                 if time_range and (timestamp < time_range[0] or timestamp > time_range[1]):
                     continue
-                
-                try:
-                    msg = reader.deserialize(rawdata, connection.msgtype)
-                    frame = self._decode_image(msg)
-                    if frame is not None:
-                        synchronizer.add_right_frame(timestamp, frame)
-                except Exception as e:
-                    self.logger.debug(f"Error decoding right frame: {e}")
-                    continue
+                right_timestamps[timestamp] = (rawdata, connection.msgtype)
         
-        self.logger.info(f"Loaded {len(synchronizer.right_sync)} right frames")
+        self.logger.info(f"Indexed {len(right_timestamps)} right frames")
         
-        # Second pass: Process left frames and find synchronized pairs
+        # Sort right timestamps for efficient windowing
+        sorted_right_ts = sorted(right_timestamps.keys())
+        
+        # Second pass: Process left frames with sliding window of right frames
         self.logger.info("Processing left camera frames...")
         synced_count = 0
         dropped_count = 0
@@ -194,6 +192,10 @@ class RosbagReader:
             if not left_conns:
                 self.logger.error(f"Left camera topic not found: {left_topic}")
                 return
+            
+            # Cache for current window of right frames
+            right_frame_cache = {}
+            window_start_idx = 0
             
             for connection, timestamp, rawdata in tqdm(
                 reader.messages(connections=left_conns),
@@ -211,19 +213,53 @@ class RosbagReader:
                     if left_frame is None:
                         continue
                     
-                    # Find synchronized right frame
-                    result = synchronizer.right_sync.find_closest(timestamp)
+                    # Update right frame window: load frames within window of current left timestamp
+                    window_start = timestamp - window_duration_ns
+                    window_end = timestamp + window_duration_ns
                     
-                    if result is None:
+                    # Remove old frames from cache
+                    right_frame_cache = {ts: frame for ts, frame in right_frame_cache.items() 
+                                        if ts >= window_start}
+                    
+                    # Add new frames to cache within window
+                    while window_start_idx < len(sorted_right_ts):
+                        right_ts = sorted_right_ts[window_start_idx]
+                        
+                        if right_ts > window_end:
+                            break
+                        
+                        if right_ts >= window_start and right_ts not in right_frame_cache:
+                            # Load and decode this right frame
+                            try:
+                                rawdata, msgtype = right_timestamps[right_ts]
+                                right_msg = reader.deserialize(rawdata, msgtype)
+                                right_frame = self._decode_image(right_msg)
+                                if right_frame is not None:
+                                    right_frame_cache[right_ts] = right_frame
+                            except Exception as e:
+                                self.logger.debug(f"Error decoding right frame: {e}")
+                        
+                        window_start_idx += 1
+                    
+                    # Find best matching right frame within tolerance
+                    best_match = None
+                    min_diff = float('inf')
+                    
+                    for right_ts, right_frame in right_frame_cache.items():
+                        time_diff = abs(timestamp - right_ts)
+                        if time_diff <= sync_tolerance_ns and time_diff < min_diff:
+                            min_diff = time_diff
+                            best_match = (right_ts, right_frame)
+                    
+                    if best_match is None:
                         dropped_count += 1
-                        del left_frame  # Free memory immediately
+                        del left_frame
                         continue
                     
-                    right_timestamp, right_frame = result
-                    time_diff = abs(timestamp - right_timestamp)
+                    right_timestamp, right_frame = best_match
                     
                     synced_count += 1
-                    yield timestamp, left_frame, right_frame, right_timestamp, time_diff
+                    yield timestamp, left_frame, right_frame, right_timestamp, min_diff
                     
                     # Free memory immediately after yield
                     del left_frame, right_frame

@@ -497,6 +497,9 @@ class VideoGenerator:
                         shutil.rmtree(temp_dir)
                         return final_output
                 else:
+                    # Cleanup temp files when GPS embedding is disabled
+                    if temp_video and temp_video.parent.exists():
+                        shutil.rmtree(temp_video.parent)
                     return final_output
             else:
                 self.logger.error("No frames were processed")
@@ -513,8 +516,13 @@ class VideoGenerator:
                         video_writer.release()
                 except:
                     pass
-            if temp_video and temp_video.parent.exists():
-                shutil.rmtree(temp_video.parent)
+            # Cleanup temp directory if it exists
+            try:
+                if 'temp_video' in locals() and temp_video and temp_video.parent.exists():
+                    shutil.rmtree(temp_video.parent)
+                    self.logger.info("Cleaned up temporary files")
+            except Exception as cleanup_error:
+                self.logger.warning(f"Failed to cleanup temp directory: {cleanup_error}")
             return None
     
     def _mux_gps_track(
