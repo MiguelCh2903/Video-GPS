@@ -58,6 +58,6 @@ video:
   output_fps: 24  # Match camera frame rate
   codec: libx264  # libx264 (H.264), libx265 (H.265 better compression but slower)
   crf: 23  # Constant Rate Factor: 0-51 (lower=better quality, 18=visually lossless, 23=default, 28=good balance for file size)
-  preset: medium  # Encoding speed: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+  preset: veryfast  # Encoding speed: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
   output_dir: output
   embed_gps_track: true  # Embed GPS data for instant segmentation

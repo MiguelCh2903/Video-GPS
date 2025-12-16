@@ -148,13 +148,8 @@ class VideoGenerator:
     
     def _should_filter_trajectory(self) -> bool:
         """Check if trajectory filtering is requested."""
-        traj_cfg = self.config.trajectory
-        return all([
-            traj_cfg.start_lat is not None,
-            traj_cfg.start_lon is not None,
-            traj_cfg.end_lat is not None,
-            traj_cfg.end_lon is not None
-        ])
+        # Trajectory filtering disabled
+        return False
     
     def _filter_trajectory(self) -> Optional[tuple]:
         """
@@ -426,9 +421,13 @@ class VideoGenerator:
                                 for line in stderr_lines[-20:]:  # Last 20 lines
                                     if line:
                                         self.logger.error(f"  {line}")
+                        del frame  # Free memory
                         break
                 else:
                     video_writer.write(frame)
+                
+                # Free frame memory immediately after writing
+                del frame
                 frame_count += 1
             
             # Finalize video

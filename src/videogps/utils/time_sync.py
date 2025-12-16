@@ -19,16 +19,19 @@ class TimeSynchronizer:
     """
     Efficient time synchronization for multiple data streams.
     Uses binary search for O(log n) lookups.
+    Memory-optimized with rolling cache to prevent unbounded growth.
     """
     
-    def __init__(self, tolerance_ns: int = 50_000_000):
+    def __init__(self, tolerance_ns: int = 50_000_000, max_cache_size: int = 100):
         """
         Initialize synchronizer.
         
         Args:
             tolerance_ns: Maximum time difference for synchronization (default 50ms)
+            max_cache_size: Maximum number of items to keep in cache
         """
         self.tolerance_ns = tolerance_ns
+        self.max_cache_size = max_cache_size
         self._timestamps: List[int] = []
         self._data: Dict[int, any] = {}
     
@@ -36,6 +39,7 @@ class TimeSynchronizer:
         """
         Add timestamped data to synchronizer.
         Maintains sorted order for efficient searching.
+        Uses rolling cache to limit memory usage.
         
         Complexity: O(n) for insertion, but can be optimized with batch insertion
         
@@ -45,6 +49,11 @@ class TimeSynchronizer:
         """
         bisect.insort(self._timestamps, timestamp)
         self._data[timestamp] = data
+        
+        # Limit cache size by removing oldest entries
+        if len(self._timestamps) > self.max_cache_size:
+            old_ts = self._timestamps.pop(0)
+            del self._data[old_ts]
     
     def find_closest(self, target_timestamp: int) -> Optional[Tuple[int, any]]:
         """
@@ -126,17 +135,19 @@ class StereoSynchronizer:
     """
     Specialized synchronizer for stereo camera pairs.
     Ensures left and right images are temporally aligned.
+    Memory-optimized with rolling cache.
     """
     
-    def __init__(self, tolerance_ns: int = 50_000_000):
+    def __init__(self, tolerance_ns: int = 50_000_000, max_cache_size: int = 100):
         """
         Initialize stereo synchronizer.
         
         Args:
             tolerance_ns: Maximum time difference between stereo pairs
+            max_cache_size: Maximum frames to keep in cache (per camera)
         """
-        self.left_sync = TimeSynchronizer(tolerance_ns)
-        self.right_sync = TimeSynchronizer(tolerance_ns)
+        self.left_sync = TimeSynchronizer(tolerance_ns, max_cache_size)
+        self.right_sync = TimeSynchronizer(tolerance_ns, max_cache_size)
         self.tolerance_ns = tolerance_ns
     
     def add_left_frame(self, timestamp: int, frame: any):

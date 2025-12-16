@@ -216,6 +216,7 @@ class RosbagReader:
                     
                     if result is None:
                         dropped_count += 1
+                        del left_frame  # Free memory immediately
                         continue
                     
                     right_timestamp, right_frame = result
@@ -223,6 +224,9 @@ class RosbagReader:
                     
                     synced_count += 1
                     yield timestamp, left_frame, right_frame, right_timestamp, time_diff
+                    
+                    # Free memory immediately after yield
+                    del left_frame, right_frame
                     
                 except Exception as e:
                     self.logger.debug(f"Error processing left frame: {e}")
