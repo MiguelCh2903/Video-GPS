@@ -4,7 +4,7 @@ Handles GPS and stereo camera data extraction with progress tracking.
 """
 
 from pathlib import Path
-from typing import Optional, Iterator, Tuple, List, Dict
+from typing import Optional, Iterator, Tuple, List, Dict, Any
 import numpy as np
 import cv2
 from tqdm import tqdm
@@ -47,24 +47,104 @@ class RosbagReader:
     def get_camera_availability(
         self,
         left_topic: Optional[str],
-        right_topic: Optional[str]
-    ) -> Dict[str, bool]:
+        right_topic: Optional[str],
+        sync_tolerance_ns: int = 50_000_000,
+        max_messages_to_sample: int = 300
+    ) -> Dict[str, Any]:
         """
-        Check whether configured camera topics exist in the rosbag.
+        Check whether configured camera topics exist and contain usable data.
 
         Args:
             left_topic: Left camera topic or None/empty
             right_topic: Right camera topic or None/empty
+            sync_tolerance_ns: Stereo sync tolerance in nanoseconds
+            max_messages_to_sample: Max messages to inspect per topic
 
         Returns:
-            Dict with `left_available` and `right_available` flags
+            Dict with availability/quality flags and diagnostics
         """
         topics = set(self.get_topic_list())
-        left_available = bool(left_topic) and left_topic in topics
-        right_available = bool(right_topic) and right_topic in topics
+
+        def _probe_topic(topic: Optional[str]) -> Dict[str, Any]:
+            stats: Dict[str, Any] = {
+                "configured": bool(topic),
+                "topic": topic,
+                "exists": False,
+                "message_count": 0,
+                "sampled_messages": 0,
+                "nonempty_messages": 0,
+                "decoded_frames": 0,
+                "first_timestamp_ns": None,
+                "last_timestamp_ns": None,
+                "decoded_timestamps_ns": [],
+                "usable": False,
+            }
+
+            if not topic:
+                return stats
+
+            stats["exists"] = topic in topics
+            if not stats["exists"]:
+                return stats
+
+            with AnyReader([self.rosbag_path], default_typestore=self.typestore) as reader:
+                conns = [c for c in reader.connections if c.topic == topic]
+                stats["message_count"] = sum(c.msgcount for c in conns)
+
+                for connection, timestamp, rawdata in reader.messages(connections=conns):
+                    if stats["sampled_messages"] >= max_messages_to_sample:
+                        break
+
+                    stats["sampled_messages"] += 1
+                    if stats["first_timestamp_ns"] is None:
+                        stats["first_timestamp_ns"] = timestamp
+                    stats["last_timestamp_ns"] = timestamp
+
+                    try:
+                        msg = reader.deserialize(rawdata, connection.msgtype)
+
+                        payload = getattr(msg, "data", None)
+                        if payload is not None and len(payload) > 0:
+                            stats["nonempty_messages"] += 1
+
+                        frame = self._decode_image(msg)
+                        if frame is not None:
+                            stats["decoded_frames"] += 1
+                            stats["decoded_timestamps_ns"].append(timestamp)
+                    except Exception:
+                        continue
+
+            stats["usable"] = stats["decoded_frames"] > 0 and stats["nonempty_messages"] > 0
+            return stats
+
+        left_stats = _probe_topic(left_topic)
+        right_stats = _probe_topic(right_topic)
+
+        sample_sync_pairs = 0
+        if left_stats["usable"] and right_stats["usable"]:
+            left_ts = left_stats["decoded_timestamps_ns"]
+            right_ts = right_stats["decoded_timestamps_ns"]
+            i, j = 0, 0
+            while i < len(left_ts) and j < len(right_ts):
+                diff = left_ts[i] - right_ts[j]
+                abs_diff = abs(diff)
+                if abs_diff <= sync_tolerance_ns:
+                    sample_sync_pairs += 1
+                    i += 1
+                    j += 1
+                elif diff < 0:
+                    i += 1
+                else:
+                    j += 1
+
         return {
-            "left_available": left_available,
-            "right_available": right_available,
+            "left_available": left_stats["exists"],
+            "right_available": right_stats["exists"],
+            "left_usable": left_stats["usable"],
+            "right_usable": right_stats["usable"],
+            "sample_sync_pairs": sample_sync_pairs,
+            "left_stats": left_stats,
+            "right_stats": right_stats,
         }
     
     def extract_gps_trajectory(
@@ -193,6 +273,9 @@ class RosbagReader:
             # Open right reader for on-demand loading
             with AnyReader([self.rosbag_path], default_typestore=self.typestore) as right_reader:
                 right_conns = [c for c in right_reader.connections if c.topic == right_topic]
+                if not right_conns:
+                    self.logger.error(f"Right camera topic not found: {right_topic}")
+                    return
                 
                 # Build iterator for right frames
                 right_iter = right_reader.messages(connections=right_conns)

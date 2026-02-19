@@ -165,13 +165,19 @@ class VideoGenerator:
         """
         availability = self.reader.get_camera_availability(
             self.config.camera.topic_left,
-            self.config.camera.topic_right
+            self.config.camera.topic_right,
+            self.config.camera.sync_tolerance_ns
         )
 
         left_available = availability["left_available"]
         right_available = availability["right_available"]
+        left_usable = availability.get("left_usable", left_available)
+        right_usable = availability.get("right_usable", right_available)
+        sample_sync_pairs = availability.get("sample_sync_pairs", 0)
+        left_stats = availability.get("left_stats", {})
+        right_stats = availability.get("right_stats", {})
 
-        if left_available and right_available:
+        if left_usable and right_usable and sample_sync_pairs > 0:
             self.camera_mode = "stereo"
             self.active_camera_topic = self.config.camera.topic_left
             self.logger.info(
@@ -180,7 +186,24 @@ class VideoGenerator:
             )
             return True
 
-        if left_available:
+        if left_usable and right_usable and sample_sync_pairs == 0:
+            left_decoded = left_stats.get("decoded_frames", 0)
+            right_decoded = right_stats.get("decoded_frames", 0)
+            self.logger.warning(
+                "Both camera topics have decodable frames but no synchronized sample "
+                f"pairs within tolerance {self.config.camera.sync_tolerance_ns}ns. "
+                "Falling back to monocular mode."
+            )
+            if left_decoded >= right_decoded:
+                self.camera_mode = "mono-left"
+                self.active_camera_topic = self.config.camera.topic_left
+            else:
+                self.camera_mode = "mono-right"
+                self.active_camera_topic = self.config.camera.topic_right
+            self.logger.warning(f"Using monocular mode: {self.active_camera_topic}")
+            return True
+
+        if left_usable:
             self.camera_mode = "mono-left"
             self.active_camera_topic = self.config.camera.topic_left
             self.logger.warning(
@@ -188,7 +211,7 @@ class VideoGenerator:
             )
             return True
 
-        if right_available:
+        if right_usable:
             self.camera_mode = "mono-right"
             self.active_camera_topic = self.config.camera.topic_right
             self.logger.warning(
@@ -197,9 +220,19 @@ class VideoGenerator:
             return True
 
         topics = self.reader.get_topic_list()
-        self.logger.error("No configured camera topics found in rosbag")
+        self.logger.error("No usable configured camera topics found in rosbag")
         self.logger.error(f"Expected left topic: {self.config.camera.topic_left}")
         self.logger.error(f"Expected right topic: {self.config.camera.topic_right}")
+        if left_available or right_available:
+            self.logger.error(
+                "Camera diagnostics: "
+                f"left(decoded={left_stats.get('decoded_frames', 0)}, "
+                f"nonempty={left_stats.get('nonempty_messages', 0)}, "
+                f"sampled={left_stats.get('sampled_messages', 0)}), "
+                f"right(decoded={right_stats.get('decoded_frames', 0)}, "
+                f"nonempty={right_stats.get('nonempty_messages', 0)}, "
+                f"sampled={right_stats.get('sampled_messages', 0)})"
+            )
         self.logger.error(f"Available topics ({len(topics)}): {', '.join(sorted(topics))}")
         return False
     
