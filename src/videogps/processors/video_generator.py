@@ -8,7 +8,6 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
-import bisect
 
 from ..core.config import Config
 from ..core.camera_rectifier import CameraRectifier
@@ -16,6 +15,7 @@ from ..core.gps_trajectory import GPSTrajectory
 from ..processors.rosbag_reader import RosbagReader
 from ..processors.gps_overlay import GPSOverlay
 from ..processors.gps_writer import GPSTrackWriter
+from ..utils.geo_utils import haversine_distance
 from ..utils.logger import setup_logger, get_logger
 import subprocess
 import tempfile
@@ -66,6 +66,10 @@ class VideoGenerator:
         
         # Trajectory data
         self.trajectory: Optional[GPSTrajectory] = None
+
+        # Camera mode resolved from available rosbag topics
+        self.camera_mode: Optional[str] = None  # stereo | mono-left | mono-right
+        self.active_camera_topic: Optional[str] = None
         
         self.logger.info("VideoGenerator initialized")
     
@@ -80,6 +84,11 @@ class VideoGenerator:
             self.logger.info("=" * 60)
             self.logger.info("Starting video generation")
             self.logger.info("=" * 60)
+
+            # Step 0: Validate camera topics before heavy processing
+            self.logger.info("Step 0/5: Validating camera topics in rosbag")
+            if not self._resolve_camera_mode():
+                return False
             
             # Step 1: Extract GPS trajectory
             self.logger.info("Step 1/5: Extracting GPS trajectory")
@@ -118,9 +127,10 @@ class VideoGenerator:
             # Step 3: Initialize camera rectifier
             if self.config.camera.rectify_enabled:
                 self.logger.info("Step 3/5: Initializing camera rectifier")
+                camera_side = "right" if self.camera_mode == "mono-right" else "left"
                 self.rectifier = CameraRectifier(
                     self.config.calibration_path,
-                    camera_side="left",
+                    camera_side=camera_side,
                     quality=self.config.camera.undistort_quality
                 )
             else:
@@ -145,6 +155,53 @@ class VideoGenerator:
         except Exception as e:
             self.logger.exception(f"Video generation failed: {e}")
             return False
+
+    def _resolve_camera_mode(self) -> bool:
+        """
+        Resolve processing mode based on available camera topics in rosbag.
+
+        Returns:
+            True if at least one camera topic is available, False otherwise
+        """
+        availability = self.reader.get_camera_availability(
+            self.config.camera.topic_left,
+            self.config.camera.topic_right
+        )
+
+        left_available = availability["left_available"]
+        right_available = availability["right_available"]
+
+        if left_available and right_available:
+            self.camera_mode = "stereo"
+            self.active_camera_topic = self.config.camera.topic_left
+            self.logger.info(
+                f"Camera mode: stereo ({self.config.camera.topic_left}, "
+                f"{self.config.camera.topic_right})"
+            )
+            return True
+
+        if left_available:
+            self.camera_mode = "mono-left"
+            self.active_camera_topic = self.config.camera.topic_left
+            self.logger.warning(
+                f"Only left camera topic found. Using monocular mode: {self.active_camera_topic}"
+            )
+            return True
+
+        if right_available:
+            self.camera_mode = "mono-right"
+            self.active_camera_topic = self.config.camera.topic_right
+            self.logger.warning(
+                f"Only right camera topic found. Using monocular mode: {self.active_camera_topic}"
+            )
+            return True
+
+        topics = self.reader.get_topic_list()
+        self.logger.error("No configured camera topics found in rosbag")
+        self.logger.error(f"Expected left topic: {self.config.camera.topic_left}")
+        self.logger.error(f"Expected right topic: {self.config.camera.topic_right}")
+        self.logger.error(f"Available topics ({len(topics)}): {', '.join(sorted(topics))}")
+        return False
     
     def _should_filter_trajectory(self) -> bool:
         """Check if trajectory filtering is requested."""
@@ -234,19 +291,31 @@ class VideoGenerator:
         use_ffmpeg = False  # Track which encoder is being used
         frame_count = 0
         accumulated_distance = 0.0
+        gps_idx_cursor = 0
+        last_distance_idx = 0
+        trajectory_points = self.trajectory.points
+        trajectory_timestamps = self.trajectory._timestamps
         
         try:
-            # Extract synchronized stereo frames
-            frame_iterator = self.reader.extract_stereo_frames(
-                self.config.camera.topic_left,
-                self.config.camera.topic_right,
-                self.config.camera.sync_tolerance_ns,
-                time_range
-            )
-            
-            for left_ts, left_frame, right_frame, right_ts, time_diff in frame_iterator:
-                # Use left frame for video (stereo pair is validated)
-                frame = left_frame
+            # Extract frames in stereo or monocular mode.
+            if self.camera_mode == "stereo":
+                frame_iterator = (
+                    (left_ts, left_frame)
+                    for left_ts, left_frame, _right_frame, _right_ts, _time_diff
+                    in self.reader.extract_stereo_frames(
+                        self.config.camera.topic_left,
+                        self.config.camera.topic_right,
+                        self.config.camera.sync_tolerance_ns,
+                        time_range
+                    )
+                )
+            else:
+                frame_iterator = self.reader.extract_monocular_frames(
+                    self.active_camera_topic,
+                    time_range
+                )
+
+            for frame_ts, frame in frame_iterator:
                 
                 # Rectify if enabled
                 if self.rectifier is not None:
@@ -265,7 +334,7 @@ class VideoGenerator:
                 
                 # Get GPS point (with interpolation if enabled)
                 gps_point = self.trajectory.get_point_at_time(
-                    left_ts,
+                    frame_ts,
                     interpolate=self.config.gps.interpolation_enabled
                 )
                 
@@ -274,37 +343,30 @@ class VideoGenerator:
                 
                 # Add GPS data to track writer
                 if gps_writer is not None:
-                    gps_writer.add_gps_point(left_ts, gps_point, frame_count)
+                    gps_writer.add_gps_point(frame_ts, gps_point, frame_count)
                 
                 # OPTIMIZED: Only calculate speed/distance when overlay is enabled
                 if self.config.overlay.enabled:
-                    # Binary search for GPS index
-                    gps_idx = bisect.bisect_left(
-                        self.trajectory._timestamps,
-                        gps_point.timestamp
-                    )
-                    
-                    # Adjust if not exact match
-                    if gps_idx < len(self.trajectory._timestamps):
-                        if abs(self.trajectory._timestamps[gps_idx] - gps_point.timestamp) > 1e6:
-                            if gps_idx > 0:
-                                gps_idx -= 1
-                    elif gps_idx > 0:
-                        gps_idx -= 1
-                    
+                    # Monotonic cursor update avoids per-frame binary search.
+                    while (
+                        gps_idx_cursor + 1 < len(trajectory_timestamps)
+                        and trajectory_timestamps[gps_idx_cursor + 1] <= gps_point.timestamp
+                    ):
+                        gps_idx_cursor += 1
+
                     speed = 0.0
-                    if 0 <= gps_idx < len(self.trajectory.points):
-                        speed = self.trajectory.calculate_speed_at(gps_idx)
-                        
-                        # Update accumulated distance
-                        if gps_idx > 0:
-                            prev_pt = self.trajectory.points[gps_idx - 1]
-                            from ..utils.geo_utils import haversine_distance
-                            dist = haversine_distance(
+                    if 0 <= gps_idx_cursor < len(trajectory_points):
+                        speed = self.trajectory.calculate_speed_at(gps_idx_cursor)
+
+                        # Update accumulated distance only when index advances.
+                        while last_distance_idx < gps_idx_cursor:
+                            prev_pt = trajectory_points[last_distance_idx]
+                            curr_pt = trajectory_points[last_distance_idx + 1]
+                            accumulated_distance += haversine_distance(
                                 prev_pt.lat, prev_pt.lon,
-                                gps_point.lat, gps_point.lon
+                                curr_pt.lat, curr_pt.lon
                             )
-                            accumulated_distance += dist
+                            last_distance_idx += 1
                     
                     # Render GPS overlay on frame
                     frame = self.overlay_renderer.render(
@@ -312,7 +374,7 @@ class VideoGenerator:
                         gps_point,
                         speed_mps=speed,
                         distance_m=accumulated_distance,
-                        timestamp_ns=left_ts
+                        timestamp_ns=frame_ts
                     )
                 
                 # Initialize video writer on first frame
@@ -421,13 +483,13 @@ class VideoGenerator:
                                 for line in stderr_lines[-20:]:  # Last 20 lines
                                     if line:
                                         self.logger.error(f"  {line}")
-                        del frame, left_frame, right_frame, gps_point  # Free memory
+                        del frame, gps_point  # Free memory
                         break
                 else:
                     video_writer.write(frame)
                 
                 # Free all frame memory immediately after writing
-                del frame, left_frame, right_frame, gps_point
+                del frame, gps_point
                 frame_count += 1
                 
                 # Periodic garbage collection every 100 frames

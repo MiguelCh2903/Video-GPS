@@ -13,7 +13,7 @@ from pathlib import Path
 class CameraConfig:
     """Camera-related configuration."""
     topic_left: str = "/camera_left/image_raw/compressed"
-    topic_right: str = "/camera_right/image_raw/compressed"
+    topic_right: Optional[str] = "/camera_right/image_raw/compressed"
     sync_tolerance_ns: int = 50_000_000  # 50ms tolerance for stereo sync
     rectify_enabled: bool = True
     undistort_quality: str = "high"  # low, medium, high
@@ -134,8 +134,17 @@ class Config:
         """
         # Note: rosbag_path is validated in CLI, not here
         
-        if not Path(self.calibration_path).exists():
-            raise ValueError(f"Calibration file does not exist: {self.calibration_path}")
+        if self.camera.rectify_enabled and not Path(self.calibration_path).exists():
+            raise ValueError(
+                f"Calibration file does not exist (required when rectify_enabled=true): "
+                f"{self.calibration_path}"
+            )
+
+        if not self.camera.topic_left and not self.camera.topic_right:
+            raise ValueError("At least one camera topic must be configured")
+
+        if self.camera.sync_tolerance_ns <= 0:
+            raise ValueError("camera sync_tolerance_ns must be positive")
         
         if self.video.output_fps <= 0:
             raise ValueError("output_fps must be positive")

@@ -4,7 +4,7 @@ Handles GPS and stereo camera data extraction with progress tracking.
 """
 
 from pathlib import Path
-from typing import Optional, Iterator, Tuple, List
+from typing import Optional, Iterator, Tuple, List, Dict
 import numpy as np
 import cv2
 from tqdm import tqdm
@@ -13,7 +13,6 @@ from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 
 from ..core.gps_trajectory import GPSTrajectory
-from ..utils.time_sync import StereoSynchronizer
 from ..utils.logger import get_logger
 
 
@@ -44,6 +43,29 @@ class RosbagReader:
         
         # Cache topic information
         self._topic_cache = {}
+
+    def get_camera_availability(
+        self,
+        left_topic: Optional[str],
+        right_topic: Optional[str]
+    ) -> Dict[str, bool]:
+        """
+        Check whether configured camera topics exist in the rosbag.
+
+        Args:
+            left_topic: Left camera topic or None/empty
+            right_topic: Right camera topic or None/empty
+
+        Returns:
+            Dict with `left_available` and `right_available` flags
+        """
+        topics = set(self.get_topic_list())
+        left_available = bool(left_topic) and left_topic in topics
+        right_available = bool(right_topic) and right_topic in topics
+        return {
+            "left_available": left_available,
+            "right_available": right_available,
+        }
     
     def extract_gps_trajectory(
         self,
@@ -154,38 +176,12 @@ class RosbagReader:
             Tuple of (left_timestamp, left_frame, right_frame, right_timestamp, time_diff_ns)
         """
         self.logger.info("Extracting synchronized stereo frames")
-        
-        # OPTIMIZED: Use streaming approach with limited buffer
-        # Only keep recent right frames in memory (max 100 frames ~ 4 seconds @ 24fps)
+
+        # Use streaming approach with limited buffer.
+        # Keep recent right frames in memory (max 100 frames ~ 4 seconds @ 24fps).
         max_buffer_size = 100
-        
-        # Build lightweight timestamp index (only timestamps and positions, no rawdata)
-        self.logger.info("Indexing right camera timestamps...")
-        right_ts_list = []
-        with AnyReader([self.rosbag_path], default_typestore=self.typestore) as reader:
-            right_conns = [c for c in reader.connections if c.topic == right_topic]
-            
-            if not right_conns:
-                self.logger.error(f"Right camera topic not found: {right_topic}")
-                return
-            
-            for connection, timestamp, rawdata in tqdm(
-                reader.messages(connections=right_conns),
-                desc="Indexing right camera",
-                unit="frame"
-            ):
-                # Filter by time range
-                if time_range and (timestamp < time_range[0] or timestamp > time_range[1]):
-                    continue
-                right_ts_list.append(timestamp)
-        
-        self.logger.info(f"Indexed {len(right_ts_list)} right frames")
-        
-        # Sort right timestamps
-        sorted_right_ts = sorted(right_ts_list)
-        del right_ts_list  # Free memory
-        
-        # OPTIMIZED: Process with two simultaneous readers and limited buffer
+
+        # Process with two simultaneous readers and limited buffer.
         self.logger.info("Processing stereo frames with streaming...")
         synced_count = 0
         dropped_count = 0
@@ -209,7 +205,7 @@ class RosbagReader:
                 from collections import deque
                 right_buffer = deque(maxlen=max_buffer_size)
                 right_exhausted = False
-                
+
                 # Pre-load initial buffer
                 try:
                     for _ in range(max_buffer_size):
@@ -222,7 +218,7 @@ class RosbagReader:
                             right_buffer.append((r_ts, r_frame))
                 except StopIteration:
                     right_exhausted = True
-                
+
                 # Process left frames
                 for connection, timestamp, rawdata in tqdm(
                     left_reader.messages(connections=left_conns),
@@ -239,10 +235,10 @@ class RosbagReader:
                         
                         if left_frame is None:
                             continue
-                        
+
                         # Load more right frames if needed (keep buffer ahead)
-                        if not right_exhausted and len(right_buffer) > 0:
-                            last_right_ts = right_buffer[-1][0]
+                        if not right_exhausted:
+                            last_right_ts = right_buffer[-1][0] if right_buffer else float("-inf")
                             while last_right_ts < timestamp + sync_tolerance_ns:
                                 try:
                                     connection, r_ts, rawdata = next(right_iter)
@@ -256,11 +252,16 @@ class RosbagReader:
                                 except StopIteration:
                                     right_exhausted = True
                                     break
-                        
+
+                        # Drop stale right frames that cannot match current left timestamp
+                        min_valid_ts = timestamp - sync_tolerance_ns
+                        while right_buffer and right_buffer[0][0] < min_valid_ts:
+                            right_buffer.popleft()
+
                         # Find best match in buffer
                         best_match = None
                         min_diff = float('inf')
-                        
+
                         for r_ts, r_frame in right_buffer:
                             time_diff = abs(timestamp - r_ts)
                             if time_diff <= sync_tolerance_ns and time_diff < min_diff:
@@ -273,14 +274,10 @@ class RosbagReader:
                             continue
                         
                         right_timestamp, right_frame = best_match
-                        
+
                         synced_count += 1
-                        # Make copies to avoid issues with buffer reuse
-                        yield timestamp, left_frame.copy(), right_frame.copy(), right_timestamp, min_diff
-                        
-                        # Free memory immediately
-                        del left_frame
-                        
+                        yield timestamp, left_frame, right_frame, right_timestamp, min_diff
+
                     except Exception as e:
                         self.logger.debug(f"Error processing left frame: {e}")
                         continue
@@ -288,6 +285,47 @@ class RosbagReader:
         self.logger.info(
             f"Stereo sync complete: {synced_count} pairs, {dropped_count} dropped"
         )
+
+    def extract_monocular_frames(
+        self,
+        topic: str,
+        time_range: Optional[Tuple[int, int]] = None
+    ) -> Iterator[Tuple[int, np.ndarray]]:
+        """
+        Extract frames from a single camera topic.
+
+        Args:
+            topic: Camera topic name
+            time_range: Optional (start_ns, end_ns) to filter by time
+
+        Yields:
+            Tuple of (timestamp, frame)
+        """
+        self.logger.info(f"Extracting monocular frames from topic: {topic}")
+
+        with AnyReader([self.rosbag_path], default_typestore=self.typestore) as reader:
+            conns = [c for c in reader.connections if c.topic == topic]
+
+            if not conns:
+                self.logger.error(f"Camera topic not found: {topic}")
+                return
+
+            for connection, timestamp, rawdata in tqdm(
+                reader.messages(connections=conns),
+                desc="Reading monocular frames",
+                unit="frame"
+            ):
+                if time_range and (timestamp < time_range[0] or timestamp > time_range[1]):
+                    continue
+
+                try:
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    frame = self._decode_image(msg)
+                    if frame is not None:
+                        yield timestamp, frame
+                except Exception as e:
+                    self.logger.debug(f"Error processing camera frame: {e}")
+                    continue
     
     def _decode_image(self, msg: any) -> Optional[np.ndarray]:
         """
