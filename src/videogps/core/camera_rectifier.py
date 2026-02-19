@@ -7,7 +7,7 @@ import json
 import numpy as np
 import cv2
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 
 from ..utils.logger import get_logger
 
@@ -54,14 +54,16 @@ class CameraRectifier:
         else:
             raise ValueError(f"Invalid camera_side: {camera_side}")
         
-        self.img_size = tuple(self.calibration['image_size'])
+        self.base_img_size = tuple(self.calibration['image_size'])
+        self.active_img_size: Optional[Tuple[int, int]] = None
+        self._map_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
         
-        # Pre-compute rectification maps
-        self._initialize_maps()
+        # Pre-compute rectification maps for calibration resolution
+        self._initialize_maps(self.base_img_size)
         
         self.logger.info(
             f"Initialized {camera_side} camera rectifier "
-            f"(quality={quality}, size={self.img_size})"
+            f"(quality={quality}, base_size={self.base_img_size})"
         )
     
     def _load_calibration(self, calib_path: str) -> Dict[str, Any]:
@@ -84,7 +86,7 @@ class CameraRectifier:
         
         return calib
     
-    def _initialize_maps(self):
+    def _initialize_maps(self, img_size: Tuple[int, int]):
         """
         Pre-compute undistortion and rectification maps.
         
@@ -98,34 +100,65 @@ class CameraRectifier:
             'low': 1.0      # Keep all pixels
         }
         alpha = alpha_map.get(self.quality, 0.0)
+        width, height = img_size
+        base_width, base_height = self.base_img_size
+
+        # Scale intrinsic matrix if runtime image size differs from calibration size.
+        if (width, height) != (base_width, base_height):
+            sx = width / base_width
+            sy = height / base_height
+            scaled_mtx = self.mtx.copy().astype(np.float64)
+            scaled_mtx[0, 0] *= sx  # fx
+            scaled_mtx[1, 1] *= sy  # fy
+            scaled_mtx[0, 2] *= sx  # cx
+            scaled_mtx[1, 2] *= sy  # cy
+        else:
+            scaled_mtx = self.mtx
         
         # Get optimal new camera matrix
-        self.new_mtx, self.roi = cv2.getOptimalNewCameraMatrix(
-            self.mtx,
+        new_mtx, roi = cv2.getOptimalNewCameraMatrix(
+            scaled_mtx,
             self.dist,
-            self.img_size,
+            img_size,
             alpha,
-            self.img_size
+            img_size
         )
         
         # Pre-compute remap tables
         # These maps tell us where to sample from the distorted image
         # for each pixel in the undistorted image
-        self.map1, self.map2 = cv2.initUndistortRectifyMap(
-            self.mtx,
+        map1, map2 = cv2.initUndistortRectifyMap(
+            scaled_mtx,
             self.dist,
             None,  # No additional rectification rotation
-            self.new_mtx,
-            self.img_size,
+            new_mtx,
+            img_size,
             cv2.CV_32FC1  # Float32 for sub-pixel accuracy
         )
         
         # Extract ROI (Region of Interest) coordinates
-        self.x, self.y, self.w, self.h = self.roi
+        x, y, w, h = roi
+        self._map_cache[img_size] = {
+            "map1": map1,
+            "map2": map2,
+            "new_mtx": new_mtx,
+            "roi": roi,
+        }
+        self._set_active_maps(img_size)
         
         self.logger.debug(
-            f"Rectification maps computed: ROI=({self.x},{self.y},{self.w},{self.h})"
+            f"Rectification maps computed for size={img_size}: ROI=({x},{y},{w},{h})"
         )
+
+    def _set_active_maps(self, img_size: Tuple[int, int]) -> None:
+        """Select cached maps for the requested image size."""
+        maps = self._map_cache[img_size]
+        self.active_img_size = img_size
+        self.map1 = maps["map1"]
+        self.map2 = maps["map2"]
+        self.new_mtx = maps["new_mtx"]
+        self.roi = maps["roi"]
+        self.x, self.y, self.w, self.h = self.roi
     
     def rectify(self, img: np.ndarray) -> np.ndarray:
         """
@@ -140,6 +173,17 @@ class CameraRectifier:
         Returns:
             Rectified (undistorted) image
         """
+        img_size = (img.shape[1], img.shape[0])  # (width, height)
+        if img_size != self.active_img_size:
+            if img_size not in self._map_cache:
+                self.logger.info(
+                    f"Adapting {self.camera_side} rectification maps from "
+                    f"{self.base_img_size} to {img_size}"
+                )
+                self._initialize_maps(img_size)
+            else:
+                self._set_active_maps(img_size)
+
         # Apply remap transformation
         # This is highly optimized in OpenCV using SIMD instructions
         undistorted = cv2.remap(
@@ -164,7 +208,9 @@ class CameraRectifier:
         """
         if self.w > 0 and self.h > 0:
             return (self.w, self.h)
-        return self.img_size
+        if self.active_img_size is not None:
+            return self.active_img_size
+        return self.base_img_size
 
 
 class StereoRectifier:

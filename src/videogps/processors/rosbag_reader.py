@@ -102,39 +102,35 @@ class RosbagReader:
                 self.logger.error(f"GPS topic not found: {gps_topic}")
                 return None
             
-            # Count messages for progress bar
-            msg_count = sum(1 for _ in reader.messages(connections=gps_connections))
-            
-            # Reset reader
-            with AnyReader([self.rosbag_path], default_typestore=self.typestore) as reader:
-                gps_connections = [c for c in reader.connections if c.topic == gps_topic]
-                
-                # Process messages with progress bar
-                for connection, timestamp, rawdata in tqdm(
-                    reader.messages(connections=gps_connections),
-                    total=msg_count,
-                    desc="Reading GPS",
-                    unit="msg"
-                ):
-                    try:
-                        msg = reader.deserialize(rawdata, connection.msgtype)
-                        
-                        # Extract GPS data (NavSatFix message)
-                        lat = float(msg.latitude)
-                        lon = float(msg.longitude)
-                        alt = float(msg.altitude) if hasattr(msg, 'altitude') else 0.0
-                        
-                        # Get number of satellites if available
-                        num_sats = 0
-                        if hasattr(msg, 'status') and hasattr(msg.status, 'service'):
-                            num_sats = getattr(msg.status, 'service', 0)
-                        
-                        # Add point (will be filtered if invalid)
-                        trajectory.add_point(timestamp, lat, lon, alt, num_sats)
-                        
-                    except Exception as e:
-                        self.logger.debug(f"Error parsing GPS message: {e}")
-                        continue
+            # Use metadata count to avoid an expensive full pre-scan pass.
+            msg_count = sum(c.msgcount for c in gps_connections) or None
+
+            # Process messages with progress bar
+            for connection, timestamp, rawdata in tqdm(
+                reader.messages(connections=gps_connections),
+                total=msg_count,
+                desc="Reading GPS",
+                unit="msg"
+            ):
+                try:
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    
+                    # Extract GPS data (NavSatFix message)
+                    lat = float(msg.latitude)
+                    lon = float(msg.longitude)
+                    alt = float(msg.altitude) if hasattr(msg, 'altitude') else 0.0
+                    
+                    # Get number of satellites if available
+                    num_sats = 0
+                    if hasattr(msg, 'status') and hasattr(msg.status, 'service'):
+                        num_sats = getattr(msg.status, 'service', 0)
+                    
+                    # Add point (will be filtered if invalid)
+                    trajectory.add_point(timestamp, lat, lon, alt, num_sats)
+                    
+                except Exception as e:
+                    self.logger.debug(f"Error parsing GPS message: {e}")
+                    continue
         
         # Finalize batch processing for efficient sorting
         trajectory.finalize_batch()

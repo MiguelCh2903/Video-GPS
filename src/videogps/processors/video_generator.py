@@ -327,10 +327,25 @@ class VideoGenerator:
                     scale = self.config.camera.max_width / w
                     new_w = self.config.camera.max_width
                     new_h = int(h * scale)
-                    # Ensure height is even for H.264 encoding (required by libx264)
+                    # Ensure dimensions are even for H.264 encoding (required by libx264)
+                    if new_w % 2 != 0:
+                        new_w -= 1
                     if new_h % 2 != 0:
                         new_h -= 1
                     frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                # libx264 requires both dimensions to be divisible by 2.
+                # Rectification ROI can produce odd sizes even without resize.
+                h, w = frame.shape[:2]
+                if (w % 2) != 0 or (h % 2) != 0:
+                    even_w = w - (w % 2)
+                    even_h = h - (h % 2)
+                    if even_w <= 0 or even_h <= 0:
+                        self.logger.error(
+                            f"Invalid frame size after even-dimension adjustment: {w}x{h}"
+                        )
+                        continue
+                    frame = frame[:even_h, :even_w]
                 
                 # Get GPS point (with interpolation if enabled)
                 gps_point = self.trajectory.get_point_at_time(
