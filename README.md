@@ -195,7 +195,6 @@ overlay:
   position: top_left
   show_altitude: true
 ```
-
 ## Requirements
 
 - Python 3.8+
